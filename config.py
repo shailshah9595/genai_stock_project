@@ -1,0 +1,4 @@
+# config.py
+OPENAI_API_KEY = "{OPEN_API_KEY}"
+NEWS_API_KEY = "{NEWS_API_KEY}" 
+
