@@ -1,49 +1,60 @@
-"""fetch_data.py
-Utilities to fetch historical stock prices and recent news.
-- Uses yfinance for price data
-- Optionally uses NewsAPI (newsapi-python) for headlines (NewsAPI key required)
-"""
 import yfinance as yf
 import pandas as pd
 from datetime import datetime, timedelta
 
 def fetch_prices(ticker: str, days: int = 30) -> pd.DataFrame:
-    """Fetch daily OHLCV for the past `days` trading days using yfinance."""
     end = datetime.utcnow().date()
-    start = end - timedelta(days=int(days * 1.5))  # a bit extra to account for weekends
+    start = end - timedelta(days=int(days * 1.5))
+
     df = yf.download(ticker, start=start.isoformat(), end=end.isoformat(), progress=False)
+
     if df.empty:
-        raise ValueError(f"No price data fetched for {ticker}. Check ticker symbol or network.")
-    df = df.dropna()
-    # Keep only the last `days` rows
-    df = df.tail(days).copy()
-    # Reset index to have Date as a column
+        raise ValueError(f"No price data fetched for {ticker}.")
+
+    # --- Flatten multi-level columns ---
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+
+    # Keep last N rows
+    df = df.dropna().tail(days).copy()
     df.reset_index(inplace=True)
     df['Date'] = df['Date'].dt.strftime('%Y-%m-%d')
-    cols = ['Date','Open','High','Low','Close','Volume']
-    if 'Adj Close' in df.columns:
-      cols.insert(5,'Adj Close')
 
-    return df[cols]
+    # Ensure numeric columns
+    numeric_cols = ['Open','High','Low','Close','Volume']
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+
+    # Compute SMA7
+    df['SMA7'] = df['Close'].rolling(window=7, min_periods=1).mean().fillna(method='bfill').astype(float)
+
+    return df[['Date','Open','High','Low','Close','Volume','SMA7']]
 
 def format_prices_for_prompt(df: pd.DataFrame) -> str:
-    """Turn the price DataFrame into a simple text table for the LLM prompt."""
+    """Format prices into a text table for LLM prompt, ensuring all scalars."""
     lines = []
-    lines.append("Date Open High Low Close Volume")
+    lines.append("Date Open High Low Close Volume SMA7")
 
     for _, r in df.iterrows():
-        open_p = float(r["Open"])
-        high_p = float(r["High"])
-        low_p = float(r["Low"])
-        close_p = float(r["Close"])
-        volume = int(r["Volume"])
+        date = r['Date']
+        open_p = float(r['Open'])
+        high_p = float(r['High'])
+        low_p = float(r['Low'])
+        close_p = float(r['Close'])
+        volume = int(r['Volume'])
 
-        lines.append(
-            f"{r['Date']} {open_p:.2f} {high_p:.2f} {low_p:.2f} {close_p:.2f} {volume}"
-        )
+        # Ensure SMA7 is a scalar float
+        sma7 = r['SMA7']
+        if hasattr(sma7, "__len__"):  # if somehow it is a Series
+            sma7 = float(sma7.iloc[0])
+        else:
+            sma7 = float(sma7)
+
+        line = f"{date} {open_p:.2f} {high_p:.2f} {low_p:.2f} {close_p:.2f} {volume} {sma7:.2f}"
+        lines.append(line)
 
     return "\n".join(lines)
-
 
 def fetch_market_context(symbol: str) -> str:
     stock = yf.Ticker(symbol)
@@ -60,7 +71,6 @@ def fetch_market_context(symbol: str) -> str:
     today_change = ((s["Close"].iloc[-1] - s["Close"].iloc[-2]) / s["Close"].iloc[-2]) * 100
     spy_change = ((i["Close"].iloc[-1] - i["Close"].iloc[-2]) / i["Close"].iloc[-2]) * 100
     vix_level = v["Close"].iloc[-1]
-
     gap = ((s["Open"].iloc[-1] - s["Close"].iloc[-2]) / s["Close"].iloc[-2]) * 100
 
     context = f"""
@@ -77,9 +87,8 @@ Interpretation guidance:
 """
     return context
 
-# Optional: News fetching (NewsAPI)
 def fetch_news_headlines(query: str, api_key: str = None, page_size: int = 5):
-    """Return a list of recent headlines about `query`. Requires NewsAPI key. If not provided, returns empty list."""
+    """Return a list of recent headlines about `query`. Requires NewsAPI key."""
     if not api_key:
         return []
     try:

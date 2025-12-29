@@ -1,29 +1,25 @@
-"""genai_predict.py
-Wrapper that builds prompts and calls the OpenAI API to get a trend prediction
-The model is asked to return:
-  - Trend: UP / DOWN / STABLE
-  - Confidence: 0-100%
-  - Short explanation suitable for a high-schooler
-IMPORTANT: Add your OPENAI_API_KEY in the environment variable OPENAI_API_KEY before running.
-"""
 import os
 import openai
 from typing import List, Dict
-from config import OPENAI_API_KEY
-from config import NEWS_API_KEY
+from config import OPENAI_API_KEY, NEWS_API_KEY
 
-#OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY') or ''
-if not OPENAI_API_KEY:
-    # We will not error here; the caller can handle the missing key.
-    pass
-else:
+if OPENAI_API_KEY:
     openai.api_key = OPENAI_API_KEY
 
-def build_prompt(ticker: str, price_table: str, headlines: List[str], market_context: List[str]) -> str:
-    """Create a clear prompt for the LLM."""
+# -----------------------------
+# Prompt Builder
+# -----------------------------
+def build_prompt(
+    ticker: str,
+    price_table: str,
+    headlines: List[str],
+    market_context: str,
+    prediction_days: int = 7
+) -> str:
+    """Create a prompt for the LLM to predict multiple days."""
     news_text = "\n".join([f"{i+1}. {h}" for i,h in enumerate(headlines)]) if headlines else "(No headlines available)"
     prompt = f"""
-You are a cautious financial market analyst.
+You are a careful financial market analyst.
 
 {market_context}
 
@@ -34,53 +30,32 @@ RECENT NEWS HEADLINES:
 {news_text}
 
 INSTRUCTIONS:
-- Give higher weight to today's market context
-- If today's move contradicts historical trend, explain why
-- If confidence is low, say "SIDEWAYS"
-- Do NOT give financial advice
-- Short-term outlook: next 1–5 trading days
+- Predict the short-term price direction for the next {prediction_days} trading days.
+- For each day, provide:
+  Day N: Direction: UP / DOWN / SIDEWAYS, Confidence: 0-100%, Reasoning (1-3 bullets)
+- Give higher weight to today's market context.
+- If today's move contradicts historical trend, explain why.
+- If confidence < 60%, Direction MUST be SIDEWAYS.
+- Do NOT give financial advice.
+- Use plain English suitable for a high-schooler.
 
 OUTPUT FORMAT (MANDATORY):
-Direction: one of [UP, DOWN, SIDEWAYS]
-Confidence: integer between 0 and 100
-Reasoning:
+Day 1: Direction: <UP/DOWN/SIDEWAYS>, Confidence: <number 0-100>, Reasoning:
 - Bullet 1
 - Bullet 2
 - Bullet 3
 
-RULES:
-- NEVER output "None" or empty values
-- If confidence < 60%, Direction MUST be SIDEWAYS
-- If information is conflicting, explain why in bullets
-
-"""
-    old_prompt = f"""You are a helpful assistant asked to give a short stock trend prediction for a high-school audience.
-
-Here is today market context. 
-{market_context}
-
-Here are the recent daily prices for {ticker} (most recent last):
-{price_table}
-
-Recent news headlines about {ticker} (if any):
-{news_text}
-
-Using only the information above, do the following:
-1) Predict whether the stock price will go UP, DOWN, or STAY STABLE tomorrow (choose one of: UP / DOWN / STABLE).
-2) Give a confidence level (0-100%). Be honest and conservative.
-3) Write a one-paragraph explanation in plain English that a high-schooler can understand.
-
-Output format (strictly):
-TREND: <UP / DOWN / STABLE>
-CONFIDENCE: <number 0-100>%
-EXPLANATION: <one paragraph>
+Repeat for each day up to Day {prediction_days}.
 """
     return prompt
 
+# -----------------------------
+# Call OpenAI
+# -----------------------------
 def call_openai(prompt: str, model: str = 'gpt-4', temperature: float = 0.4) -> str:
-    """Call OpenAI chat completion. Returns the assistant's text output."""
+    """Call OpenAI ChatCompletion API and return response text."""
     if not openai.api_key:
-        raise RuntimeError("OPENAI_API_KEY is not configured in the environment. Set environment variable OPENAI_API_KEY.")
+        raise RuntimeError("OPENAI_API_KEY is not configured in the environment.")
     resp = openai.ChatCompletion.create(
         model=model,
         messages=[
@@ -88,24 +63,54 @@ def call_openai(prompt: str, model: str = 'gpt-4', temperature: float = 0.4) -> 
             {"role": "user", "content": prompt}
         ],
         temperature=temperature,
-        max_tokens=400
+        max_tokens=600
     )
     text = resp['choices'][0]['message']['content'].strip()
     return text
 
-def parse_response(text: str) -> Dict[str,str]:
-    """Parse the model's response into fields. This is forgiving but expects labels."""
-    out = {'raw': text, 'trend': None, 'confidence': None, 'explanation': None}
+# -----------------------------
+# Parse multi-day response
+# -----------------------------
+def parse_response(text: str, days: int = 7) -> Dict[str, Dict]:
+    """
+    Parse LLM output for multiple days.
+    Returns: dict like {'Day 1': {'trend':..., 'confidence':..., 'reasoning':[...]} ...}
+    """
+    out = {}
     lines = [l.strip() for l in text.splitlines() if l.strip()]
+    current_day = None
+    reasoning = []
+
     for line in lines:
-        if line.upper().startswith('TREND:'):
-            out['trend'] = line.split(':',1)[1].strip()
-        elif line.upper().startswith('CONFIDENCE:'):
-            out['confidence'] = line.split(':',1)[1].strip()
-        elif line.upper().startswith('EXPLANATION:'):
-            out['explanation'] = line.split(':',1)[1].strip()
-    # If explanation spans multiple lines, assemble the remaining
-    if out['explanation'] is None and len(lines) >= 1:
-        # fallback: everything after first label-like line
-        out['explanation'] = '\n'.join(lines[1:])
+        # Detect Day N
+        if line.upper().startswith("DAY"):
+            if current_day:
+                out[current_day] = {"trend": trend, "confidence": confidence, "reasoning": reasoning}
+            current_day = line.split(":",1)[0].strip()
+            trend = "SIDEWAYS"
+            confidence = 50
+            reasoning = []
+
+            # Try to extract trend and confidence from same line
+            if "Direction:" in line and "Confidence:" in line:
+                try:
+                    trend_part = line.split("Direction:")[1].split(",")[0].strip()
+                    conf_part = line.split("Confidence:")[1].split(",")[0].strip()
+                    trend = trend_part
+                    confidence = int(''.join(filter(str.isdigit, conf_part)))
+                except:
+                    pass
+        elif line.startswith("-") and current_day:
+            reasoning.append(line.lstrip("- ").strip())
+
+    # Save last day
+    if current_day:
+        out[current_day] = {"trend": trend, "confidence": confidence, "reasoning": reasoning}
+
+    # Fill missing days with default
+    for d in range(1, days+1):
+        day_key = f"Day {d}"
+        if day_key not in out:
+            out[day_key] = {"trend": "SIDEWAYS", "confidence": 50, "reasoning": ["Market unclear"]}
+
     return out
